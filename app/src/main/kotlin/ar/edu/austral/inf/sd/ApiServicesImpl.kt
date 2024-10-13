@@ -8,15 +8,20 @@ import ar.edu.austral.inf.sd.server.api.ReconfigureApiService
 import ar.edu.austral.inf.sd.server.api.UnregisterNodeApiService
 import ar.edu.austral.inf.sd.server.model.PlayResponse
 import ar.edu.austral.inf.sd.server.model.RegisterResponse
+import ar.edu.austral.inf.sd.server.model.RegisteredNode
 import ar.edu.austral.inf.sd.server.model.Signature
 import ar.edu.austral.inf.sd.server.model.Signatures
+import jakarta.validation.ConstraintViolation
+import jakarta.validation.ConstraintViolationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.getAndUpdate
 import kotlinx.coroutines.flow.update
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.http.HttpStatus
 import org.springframework.stereotype.Component
 import org.springframework.web.context.request.RequestContextHolder
 import org.springframework.web.context.request.ServletRequestAttributes
+import org.springframework.web.server.ResponseStatusException
 import java.security.MessageDigest
 import java.util.*
 import java.util.concurrent.CountDownLatch
@@ -31,7 +36,7 @@ class ApiServicesImpl : RegisterNodeApiService, RelayApiService, PlayApiService,
 
     @Value("\${server.port:8080}")
     private val myServerPort: Int = 0
-    private val nodes: MutableList<RegisterResponse> = mutableListOf()
+    private val nodes: MutableList<RegisteredNode> = mutableListOf()
     private var nextNode: RegisterResponse? = null
     private val messageDigest = MessageDigest.getInstance("SHA-512")
     private val salt = Base64.getEncoder().encodeToString(Random.nextBytes(9))
@@ -42,21 +47,67 @@ class ApiServicesImpl : RegisterNodeApiService, RelayApiService, PlayApiService,
     private var currentMessageResponse = MutableStateFlow<PlayResponse?>(null)
     private var xGameTimestamp: Int = 0
 
+    @Value("DefaultTimeOut")
+    private var timeout : Int = 0
+
     override fun registerNode(host: String?, port: Int?, uuid: UUID?, salt: String?, name: String?): RegisterResponse {
+        //TODO: central node should be in the list, I dont think so, in consequence I remove it but check in the interface
 
-        val nextNode = if (nodes.isEmpty()) {
-            // es el primer nodo
-            val me = RegisterResponse(currentRequest.serverName, myServerPort, "", "")
-            nodes.add(me)
-            me
-        } else {
-            nodes.last()
+        //TODO: find the correct way to check for violations, in general spring use it by it self, but I am getting optionals here
+        //data
+        val violations = validationViolationsFromRegisterConstrains(host, port, uuid, salt, name)
+        if (!violations.isEmpty())
+            throw ConstraintViolationException(
+                "Parameter constraints violated",
+                listOf<ConstraintViolation<RegisteredNode>>().toSet()
+            )
+
+        return when (checkForRegistryValidation(uuid!!, salt!!)) {
+            RegistryValidation.Valid -> {
+                val response : RegisterResponse = buildRegisterResponse();
+                nodes.add(RegisteredNode(name, host!!, port!!, uuid, salt, response))
+
+                response
+            }
+            RegistryValidation.Invalid ->  throw ResponseStatusException(HttpStatus.UNAUTHORIZED, "Unauthorized access")
+            RegistryValidation.Exists -> {
+                val node = nodes.find { n -> n.uuid == uuid }
+                //TODO: add code 202 to response
+                node!!.lastRegisterResponse
+            }
         }
-        val node = RegisterResponse(host!!, port!!, uuid, salt)
-        nodes.add(node)
 
-        return RegisterResponse(nextNode.nextHost, nextNode.nextPort, uuid, newSalt())
     }
+
+    private fun validationViolationsFromRegisterConstrains(
+        host: String?, port: Int?, uuid: UUID?, salt: String?, name: String?
+    ) : List<String> {
+        val violations = mutableListOf<String>()
+        if (host == null) violations.add("Host must be defined")
+        if (port == null) violations.add("Port must be defined")
+        if (uuid == null) violations.add("UUID must be defined")
+        if (salt == null) violations.add("Salt must be defined")
+        if (name == null) violations.add("Name must be defined")
+        return violations
+    }
+
+    private fun checkForRegistryValidation(uuid: UUID, salt: String) : RegistryValidation {
+        val node = nodes.find { n -> n.uuid == uuid }
+        return if (node == null) RegistryValidation.Valid
+        else if (node.salt == salt) RegistryValidation.Exists
+        else RegistryValidation.Invalid
+    }
+
+    private enum class RegistryValidation {
+        Valid, Invalid, Exists
+    }
+
+    private fun buildRegisterResponse() =
+        if (nodes.isEmpty()) RegisterResponse(myServerName, myServerPort, timeout, xGameTimestamp)
+        else {
+            val lastNode = nodes.last();
+            RegisterResponse(lastNode.host, lastNode.port, timeout, xGameTimestamp)
+        }
 
     override fun relayMessage(message: String, signatures: Signatures, xGameTimestamp: Int?): Signature {
         val receivedHash = doHash(message.encodeToByteArray(), salt)
